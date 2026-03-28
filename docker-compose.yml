@@ -1,0 +1,22 @@
+services:
+  discord-spotify-bot:
+    build: .
+    restart: unless-stopped
+
+    # Credentials are read from your .env file — never hardcode them here.
+    # Copy .env.example → .env and fill in all values before running.
+    env_file: .env
+
+    # Override / add env vars that differ between local and container.
+    environment:
+      # Structured logging: adjust level as needed (trace/debug/info/warn/error)
+      RUST_LOG: discord_spotify_bot=info,songbird=warn
+
+      # The OAuth callback server always listens on 3000 inside the container.
+      AUTH_SERVER_PORT: "3000"
+
+    ports:
+      # HOST_PORT:3000 — change the left side to match your reverse-proxy config.
+      # SPOTIFY_REDIRECT_URI in .env must point to the public URL that forwards
+      # here, e.g. https://yourhost.example.com/auth/callback
+      - "3000:3000"

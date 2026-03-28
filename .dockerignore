@@ -1,0 +1,21 @@
+# Build artifacts — largest directory, must be excluded to keep context small
+target/
+
+# Local secrets — never baked into the image
+.env
+
+# Version control
+.git/
+.gitignore
+
+# Editor / IDE
+.cursor/
+.vscode/
+*.swp
+*.swo
+
+# macOS
+.DS_Store
+
+# Docs / scripts that don't belong in the build context
+*.md
