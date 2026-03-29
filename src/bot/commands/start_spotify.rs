@@ -2,8 +2,9 @@ use std::{sync::Arc, time::Duration};
 
 use librespot_playback::player::PlayerEvent;
 use serenity::all::{
-    ActivityData, CommandInteraction, Context, CreateInteractionResponse,
-    CreateInteractionResponseMessage, CreateMessage, OnlineStatus,
+    ActivityData, Color, CommandInteraction, Context, CreateEmbed, CreateEmbedAuthor,
+    CreateEmbedFooter, CreateInteractionResponse, CreateInteractionResponseMessage, CreateMessage,
+    OnlineStatus,
 };
 use songbird::input::{Input, RawAdapter};
 use tokio::sync::oneshot;
@@ -28,23 +29,25 @@ pub async fn run(ctx: &Context, command: &CommandInteraction, cfg: Arc<Config>, 
         }
     };
 
-    let voice_channel_id = {
-        ctx.cache
-            .guild(guild_id)
-            .and_then(|g| {
-                g.voice_states
-                    .get(&command.user.id)
-                    .and_then(|vs| vs.channel_id)
-            })
-    };
+    let voice_ch_id = ctx
+        .cache
+        .guild(guild_id)
+        .and_then(|g| {
+            g.voice_states
+                .get(&command.user.id)
+                .and_then(|vs| vs.channel_id)
+        });
 
-    let channel_id = match voice_channel_id {
+    let voice_ch_id = match voice_ch_id {
         Some(id) => id,
         None => {
             reply_ephemeral(ctx, command, "You need to be in a voice channel first.").await;
             return;
         }
     };
+
+    // Text channel where the command was run — used for public announcements.
+    let text_ch_id = command.channel_id;
 
     // ── 2. Send ephemeral auth link ───────────────────────────────────────
     let user_id = command.user.id.to_string();
@@ -78,7 +81,7 @@ pub async fn run(ctx: &Context, command: &CommandInteraction, cfg: Arc<Config>, 
     let spotify_name = get_spotify_user(&tokens.access_token)
         .await
         .unwrap_or_else(|_| "Unknown".to_string());
-    info!("Spotify user: {spotify_name} — joining voice channel {channel_id}");
+    info!("Spotify user: {spotify_name} — joining voice channel {voice_ch_id}");
 
     follow_up(
         ctx,
@@ -110,7 +113,7 @@ pub async fn run(ctx: &Context, command: &CommandInteraction, cfg: Arc<Config>, 
         }
     };
 
-    let handler_lock = match manager.join(guild_id, channel_id).await {
+    let handler_lock = match manager.join(guild_id, voice_ch_id).await {
         Ok(h) => h,
         Err(e) => {
             error!("Failed to join voice channel: {e}");
@@ -135,9 +138,8 @@ pub async fn run(ctx: &Context, command: &CommandInteraction, cfg: Arc<Config>, 
     )
     .await;
 
-    // Public channel announcement so everyone sees when a Jam starts
-    let _ = command
-        .channel_id
+    // Public channel announcement
+    let _ = text_ch_id
         .send_message(
             &ctx.http,
             CreateMessage::new().content(format!(
@@ -149,13 +151,12 @@ pub async fn run(ctx: &Context, command: &CommandInteraction, cfg: Arc<Config>, 
 
     // ── 8. Jam URL: post the join link publicly when a Jam is started ─────
     let ctx_jam = ctx.clone();
-    let channel_id = command.channel_id;
     let bot_name_jam = device_name.clone();
     tokio::spawn(async move {
         let mut rx = jam_url_rx;
         while let Some(url) = rx.recv().await {
             info!("Jam session started: {url}");
-            let _ = channel_id
+            let _ = text_ch_id
                 .send_message(
                     &ctx_jam.http,
                     CreateMessage::new().content(format!(
@@ -166,45 +167,95 @@ pub async fn run(ctx: &Context, command: &CommandInteraction, cfg: Arc<Config>, 
         }
     });
 
-    // ── 9. Presence: update "Listening to" status as tracks change ────────
-    let ctx_presence = ctx.clone();
+    // ── 9. Now-playing embed + presence update on every track change ───────
+    let ctx_np = ctx.clone();
+    let device_name_np = device_name.clone();
     tokio::spawn(async move {
         let mut events = event_channel;
         while let Some(event) = events.recv().await {
             match event {
                 PlayerEvent::TrackChanged { audio_item } => {
-                    let track = &audio_item.name;
-                    let artist = match &audio_item.unique_fields {
-                        librespot_metadata::audio::UniqueFields::Track { artists, .. } => {
-                            artists
-                                .0
-                                .iter()
-                                .map(|a| a.name.as_str())
-                                .collect::<Vec<_>>()
-                                .join(", ")
+                    // ── Extract metadata ──────────────────────────────────
+                    let track = audio_item.name.clone();
+
+                    let (artist, album) = match &audio_item.unique_fields {
+                        librespot_metadata::audio::UniqueFields::Track { artists, album, .. } => (
+                            artists.0.iter().map(|a| a.name.as_str()).collect::<Vec<_>>().join(", "),
+                            album.clone(),
+                        ),
+                        librespot_metadata::audio::UniqueFields::Local { artists, album, .. } => (
+                            artists.as_deref().unwrap_or("Unknown artist").to_string(),
+                            album.as_deref().unwrap_or("").to_string(),
+                        ),
+                        librespot_metadata::audio::UniqueFields::Episode { show_name, .. } => {
+                            (show_name.clone(), String::new())
                         }
-                        librespot_metadata::audio::UniqueFields::Local { artists, .. } => {
-                            artists.as_deref().unwrap_or("").to_string()
-                        }
-                        librespot_metadata::audio::UniqueFields::Episode {
-                            show_name, ..
-                        } => show_name.clone(),
                     };
+
+                    // Largest cover image available
+                    let cover_url = audio_item
+                        .covers
+                        .iter()
+                        .max_by_key(|c| c.width)
+                        .map(|c| c.url.clone())
+                        .unwrap_or_default();
+
+                    // spotify:track:ID → https://open.spotify.com/track/ID
+                    let spotify_url = audio_item
+                        .uri
+                        .strip_prefix("spotify:")
+                        .map(|rest| {
+                            format!("https://open.spotify.com/{}", rest.replacen(':', "/", 1))
+                        })
+                        .unwrap_or_default();
+
+                    // mm:ss duration
+                    let duration = {
+                        let total = audio_item.duration_ms / 1000;
+                        format!("{}:{:02}", total / 60, total % 60)
+                    };
+
+                    let explicit_tag = if audio_item.is_explicit { " 🅴" } else { "" };
+
                     let status = format!("{track} · {artist}");
                     info!("Now playing: {status}");
-                    ctx_presence.set_presence(
+
+                    // ── Discord presence ──────────────────────────────────
+                    ctx_np.set_presence(
                         Some(ActivityData::listening(&status)),
                         OnlineStatus::Online,
                     );
+
+                    // ── Now-playing embed ─────────────────────────────────
+                    let mut embed = CreateEmbed::new()
+                        .author(CreateEmbedAuthor::new(&artist))
+                        .title(format!("{track}{explicit_tag}"))
+                        .color(Color::from_rgb(30, 215, 96)) // Spotify green
+                        .footer(CreateEmbedFooter::new(format!(
+                            "🎧 {device_name_np}  ·  {duration}"
+                        )));
+
+                    if !spotify_url.is_empty() {
+                        embed = embed.url(&spotify_url);
+                    }
+                    if !album.is_empty() {
+                        embed = embed.description(format!("*{album}*"));
+                    }
+                    if !cover_url.is_empty() {
+                        embed = embed.thumbnail(&cover_url);
+                    }
+
+                    let _ = text_ch_id
+                        .send_message(&ctx_np.http, CreateMessage::new().embed(embed))
+                        .await;
                 }
                 PlayerEvent::Stopped { .. } => {
-                    ctx_presence.set_presence(None, OnlineStatus::Online);
+                    ctx_np.set_presence(None, OnlineStatus::Online);
                 }
                 _ => {}
             }
         }
-        // Channel closed (librespot shut down) — clear presence
-        ctx_presence.set_presence(None, OnlineStatus::Online);
+        ctx_np.set_presence(None, OnlineStatus::Online);
     });
 
     // ── 10. Watcher: clean up when the voice channel empties ──────────────
@@ -216,9 +267,10 @@ pub async fn run(ctx: &Context, command: &CommandInteraction, cfg: Arc<Config>, 
                 .cache
                 .guild(guild_id)
                 .map(|g| {
-                    g.voice_states
-                        .values()
-                        .any(|vs| vs.channel_id == Some(channel_id) && vs.user_id != ctx2.cache.current_user().id)
+                    g.voice_states.values().any(|vs| {
+                        vs.channel_id == Some(voice_ch_id)
+                            && vs.user_id != ctx2.cache.current_user().id
+                    })
                 })
                 .unwrap_or(false);
 
