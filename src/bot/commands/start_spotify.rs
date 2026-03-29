@@ -8,7 +8,7 @@ use serenity::all::{
 };
 use songbird::input::{Input, RawAdapter};
 use tokio::sync::oneshot;
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 use crate::{
     config::Config,
@@ -150,17 +150,31 @@ pub async fn run(ctx: &Context, command: &CommandInteraction, cfg: Arc<Config>, 
         .await;
 
     // ── 8. Jam URL: post the join link publicly when a Jam is started ─────
+    // We deduplicate by session token so repeated `session_update` events
+    // (USER_JOINED, DISCOVERABILITY_CHANGED, …) don't spam the channel.
     let ctx_jam = ctx.clone();
     let bot_name_jam = device_name.clone();
     tokio::spawn(async move {
         let mut rx = jam_url_rx;
+        let mut sent_tokens = std::collections::HashSet::new();
         while let Some(url) = rx.recv().await {
+            // The URL is always `spotify://socialsession/TOKEN` — extract TOKEN.
+            let token = url
+                .strip_prefix("spotify://socialsession/")
+                .unwrap_or(&url)
+                .to_owned();
+
+            if !sent_tokens.insert(token) {
+                debug!("Jam URL already sent, skipping: {url}");
+                continue;
+            }
+
             info!("Jam session started: {url}");
             let _ = text_ch_id
                 .send_message(
                     &ctx_jam.http,
                     CreateMessage::new().content(format!(
-                        "🎵 **{bot_name_jam}** — [Join the Jam]({url})"
+                        "🎵 **{bot_name_jam}** started a Jam — [tap to join]({url})"
                     )),
                 )
                 .await;
@@ -226,6 +240,17 @@ pub async fn run(ctx: &Context, command: &CommandInteraction, cfg: Arc<Config>, 
                         OnlineStatus::Online,
                     );
 
+                    // Album search link —  open.spotify.com/search/{album}
+                    // UniqueFields only carries the album name, not its ID,
+                    // so a search URL is the best we can do without an extra API call.
+                    let album_url = if !album.is_empty() {
+                        let mut u = url::Url::parse("https://open.spotify.com/search/").unwrap();
+                        u.path_segments_mut().unwrap().push(&album);
+                        u.to_string()
+                    } else {
+                        String::new()
+                    };
+
                     // ── Now-playing embed ─────────────────────────────────
                     let mut embed = CreateEmbed::new()
                         .author(CreateEmbedAuthor::new(&artist))
@@ -239,7 +264,12 @@ pub async fn run(ctx: &Context, command: &CommandInteraction, cfg: Arc<Config>, 
                         embed = embed.url(&spotify_url);
                     }
                     if !album.is_empty() {
-                        embed = embed.description(format!("*{album}*"));
+                        let album_desc = if !album_url.is_empty() {
+                            format!("[*{album}*]({album_url})")
+                        } else {
+                            format!("*{album}*")
+                        };
+                        embed = embed.description(album_desc);
                     }
                     if !cover_url.is_empty() {
                         embed = embed.thumbnail(&cover_url);

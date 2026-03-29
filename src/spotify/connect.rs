@@ -122,16 +122,13 @@ pub async fn create_connect_device(
 /// whose structure matches the `SessionUpdate` protobuf (field names in camelCase).
 /// We also handle the raw-binary (protobuf) case defensively by attempting a
 /// UTF-8 decode and JSON parse with both camelCase and snake_case key variants.
-fn extract_jam_url(payload: &PayloadValue) -> Option<String> {
+pub fn extract_jam_url(payload: &PayloadValue) -> Option<String> {
     match payload {
         PayloadValue::Json(json) => {
             debug!("social-connect payload (JSON): {json}");
             parse_jam_url_from_json(json)
         }
         PayloadValue::Raw(bytes) => {
-            // The payload arrived as base64-decoded binary.  Spotify sometimes
-            // sends the proto bytes directly; attempt a best-effort UTF-8 parse
-            // in case it is actually JSON wrapped in a different envelope.
             if let Ok(text) = std::str::from_utf8(bytes) {
                 debug!("social-connect payload (raw/UTF-8): {text}");
                 parse_jam_url_from_json(text)
@@ -150,29 +147,73 @@ fn extract_jam_url(payload: &PayloadValue) -> Option<String> {
     }
 }
 
-/// Try to pull `joinSessionUrl` (camelCase) or `join_session_url` (snake_case)
-/// from the top-level object or from a nested `"session"` key.
+/// Extract a `spotify://socialsession/TOKEN` deep-link from a JSON payload.
+///
+/// Priority:
+/// 1. `session.joinSessionToken` / `session.join_session_token`  →  build the
+///    deep-link from the token directly (most reliable).
+/// 2. Any `joinSessionUrl` / `join_session_url` field  →  normalise whatever
+///    URL Spotify provided (often `hm://...`) into a `spotify://` deep-link.
 fn parse_jam_url_from_json(json: &str) -> Option<String> {
     let value: serde_json::Value = serde_json::from_str(json).ok()?;
 
-    // Candidates in priority order
-    let candidates = [
-        // Standard protobuf-JSON (camelCase) — nested under "session"
-        value.pointer("/session/joinSessionUrl"),
-        // snake_case variant
-        value.pointer("/session/join_session_url"),
-        // Sometimes delivered at the top level
-        value.get("joinSessionUrl"),
-        value.get("join_session_url"),
-    ];
+    // The interesting object is either the root value or its "session" child.
+    let session = value
+        .get("session")
+        .unwrap_or(&value);
 
-    for candidate in candidates.into_iter().flatten() {
-        if let Some(url) = candidate.as_str() {
-            if !url.is_empty() {
-                return Some(url.to_owned());
+    // 1. Prefer the session token — gives us the canonical deep-link directly.
+    let token_keys = ["joinSessionToken", "join_session_token"];
+    for key in token_keys {
+        if let Some(token) = session.get(key).and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+            debug!("Jam token ({key}): {token}");
+            return Some(format!("spotify://socialsession/{token}"));
+        }
+    }
+
+    // 2. Fall back to any URL/URI field and normalise it.
+    let url_keys = [
+        "joinSessionUrl", "join_session_url",
+        "joinSessionUri", "join_session_uri",
+    ];
+    for key in url_keys {
+        if let Some(raw) = session.get(key).and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+            debug!("Jam raw url ({key}): {raw}");
+            if let Some(normalised) = normalise_jam_url(raw) {
+                return Some(normalised);
             }
         }
     }
 
+    None
+}
+
+/// Convert any Spotify-internal URL/URI into a `spotify://socialsession/TOKEN`
+/// deep-link that opens the Spotify app directly.
+///
+/// Returns `None` for completely unrecognised schemes so we never forward junk.
+fn normalise_jam_url(raw: &str) -> Option<String> {
+    // hm://social-connect/v2/sessions/join/TOKEN
+    if let Some(token) = raw
+        .strip_prefix("hm://social-connect/v2/sessions/join/")
+        .filter(|t| !t.is_empty())
+    {
+        return Some(format!("spotify://socialsession/{token}"));
+    }
+
+    // https://open.spotify.com/socialsession/TOKEN?si=...
+    if let Some(rest) = raw.strip_prefix("https://open.spotify.com/socialsession/") {
+        let token = rest.split('?').next().unwrap_or(rest);
+        if !token.is_empty() {
+            return Some(format!("spotify://socialsession/{token}"));
+        }
+    }
+
+    // Already a deep-link
+    if raw.starts_with("spotify://socialsession/") {
+        return Some(raw.to_owned());
+    }
+
+    warn!("Unrecognised Jam URL scheme, discarding: {raw}");
     None
 }
