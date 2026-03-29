@@ -1,0 +1,37 @@
+{
+  "name": "discord-spotify-bot",
+  "version": "1.0.0",
+  "description": "Discord bot that streams Spotify audio to voice channels via Playwright + Web Playback SDK",
+  "main": "dist/bot.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/bot.js",
+    "dev": "tsx src/bot.ts",
+    "deploy": "tsx src/deploy-commands.ts"
+  },
+  "type": "module",
+  "dependencies": {
+    "@discordjs/voice": "^0.19.2",
+    "@ngrok/ngrok": "^1.7.0",
+    "@spotify/web-api-ts-sdk": "^1.2.0",
+    "discord.js": "^14.16.3",
+    "dotenv": "^17.3.1",
+    "express": "^4.21.2",
+    "ffmpeg-static": "^5.3.0",
+    "librespot": "^0.2.22",
+    "librespot-node": "^1.1.2",
+    "playwright": "^1.51.0",
+    "prism-media": "^1.3.5",
+    "sodium-native": "^4.3.1",
+    "ws": "^8.18.1"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.1",
+    "@types/ffmpeg-static": "^3.0.3",
+    "@types/node": "^22.13.14",
+    "@types/ws": "^8.5.14",
+    "ts-node": "^10.9.2",
+    "tsx": "^4.21.0",
+    "typescript": "^5.8.2"
+  }
+}

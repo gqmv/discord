@@ -3,7 +3,7 @@ use std::{sync::Arc, time::Duration};
 use librespot_playback::player::PlayerEvent;
 use serenity::all::{
     ActivityData, CommandInteraction, Context, CreateInteractionResponse,
-    CreateInteractionResponseMessage, OnlineStatus,
+    CreateInteractionResponseMessage, CreateMessage, OnlineStatus,
 };
 use songbird::input::{Input, RawAdapter};
 use tokio::sync::oneshot;
@@ -91,7 +91,7 @@ pub async fn run(ctx: &Context, command: &CommandInteraction, cfg: Arc<Config>, 
 
     // ── 5. Create librespot Spirc device + PcmReader ──────────────────────
     let device_name = store.bot_name.read().await.clone();
-    let (spirc, reader, event_channel) = match create_connect_device(&device_name, &tokens.access_token).await {
+    let (spirc, reader, event_channel, jam_url_rx) = match create_connect_device(&device_name, &tokens.access_token).await {
         Ok(pair) => pair,
         Err(e) => {
             error!("Failed to create Spotify Connect device: {e}");
@@ -127,16 +127,46 @@ pub async fn run(ctx: &Context, command: &CommandInteraction, cfg: Arc<Config>, 
         handler.play_input(input);
     }
 
+    // Ephemeral confirmation to the user who ran the command
     follow_up(
         ctx,
         command,
-        &format!(
-            "🎵 **{spotify_name}** — open Spotify and pick **{device_name}** as your output device to start playing!"
-        ),
+        &format!("✅ **{spotify_name}** — open Spotify, pick **{device_name}** as your device, then hit **Start a Jam** to share the link here!"),
     )
     .await;
 
-    // ── 8. Presence: update "Listening to" status as tracks change ────────
+    // Public channel announcement so everyone sees when a Jam starts
+    let _ = command
+        .channel_id
+        .send_message(
+            &ctx.http,
+            CreateMessage::new().content(format!(
+                "🎵 **{spotify_name}** started a listening session on **{device_name}**! \
+                Open Spotify → **Start a Jam** → I'll post the link here automatically."
+            )),
+        )
+        .await;
+
+    // ── 8. Jam URL: post the join link publicly when a Jam is started ─────
+    let ctx_jam = ctx.clone();
+    let channel_id = command.channel_id;
+    let bot_name_jam = device_name.clone();
+    tokio::spawn(async move {
+        let mut rx = jam_url_rx;
+        while let Some(url) = rx.recv().await {
+            info!("Jam session started: {url}");
+            let _ = channel_id
+                .send_message(
+                    &ctx_jam.http,
+                    CreateMessage::new().content(format!(
+                        "🎵 **{bot_name_jam}** — [Join the Jam]({url})"
+                    )),
+                )
+                .await;
+        }
+    });
+
+    // ── 9. Presence: update "Listening to" status as tracks change ────────
     let ctx_presence = ctx.clone();
     tokio::spawn(async move {
         let mut events = event_channel;
@@ -177,7 +207,7 @@ pub async fn run(ctx: &Context, command: &CommandInteraction, cfg: Arc<Config>, 
         ctx_presence.set_presence(None, OnlineStatus::Online);
     });
 
-    // ── 9. Watcher: clean up when the voice channel empties ───────────────
+    // ── 10. Watcher: clean up when the voice channel empties ──────────────
     let ctx2 = ctx.clone();
     tokio::spawn(async move {
         loop {
