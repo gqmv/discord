@@ -14,6 +14,7 @@ use librespot_playback::{
     player::{Player, PlayerEventChannel},
 };
 use tokio::sync::mpsc;
+use tracing::{debug, error, info, warn};
 
 use super::sink::{DiscordSink, PcmReader};
 
@@ -30,8 +31,6 @@ pub async fn create_connect_device(
 ) -> Result<(Spirc, PcmReader, PlayerEventChannel, mpsc::UnboundedReceiver<String>)> {
     let credentials = Credentials::with_access_token(access_token);
     let session = Session::new(SessionConfig::default(), None);
-    // Keep a clone so we can subscribe to the dealer after the session is moved into Spirc.
-    let session_for_dealer = session.clone();
 
     // Bounded channel: each slot is ~20 ms of stereo f32 PCM at 44100 Hz (~7 KB).
     // 64 slots ≈ 1.3 s of audio. This throttles librespot's decode thread to
@@ -63,6 +62,16 @@ pub async fn create_connect_device(
         ..Default::default()
     };
 
+    // ── Jam session detection ────────────────────────────────────────────
+    // Register the subscription NOW, in the dealer builder phase — i.e. before
+    // Spirc::new() calls session.connect() which launches the WebSocket.  This
+    // mirrors exactly how Spirc itself registers its own subscriptions and
+    // guarantees we never miss an early delivery.
+    let (jam_tx, jam_rx) = mpsc::unbounded_channel::<String>();
+    let jam_stream = session
+        .dealer()
+        .listen_for("social-connect/v2/session_update", |msg| Ok(msg));
+
     let (spirc, spirc_task) = Spirc::new(
         connect_config,
         session,
@@ -75,33 +84,95 @@ pub async fn create_connect_device(
     // Drive the Spirc event loop in the background
     tokio::spawn(spirc_task);
 
-    // ── Jam session detection ────────────────────────────────────────────
-    // Subscribe to social-connect session updates. When the user starts a
-    // Spotify Jam with this device active, Spotify delivers a session_update
-    // that contains the `joinSessionUrl` — we forward it through a channel.
-    let (jam_tx, jam_rx) = mpsc::unbounded_channel::<String>();
-    if let Ok(mut stream) = session_for_dealer
-        .dealer()
-        .listen_for("social-connect/v2/session_update", |msg| Ok(msg))
-    {
-        tokio::spawn(async move {
-            while let Some(Ok(msg)) = stream.next().await {
-                if let PayloadValue::Json(json) = msg.payload {
-                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&json) {
-                        if let Some(url) = value
-                            .get("session")
-                            .and_then(|s| s.get("joinSessionUrl"))
-                            .and_then(|u| u.as_str())
-                            .filter(|u| !u.is_empty())
-                        {
-                            let _ = jam_tx.send(url.to_string());
+    // Spawn the task that forwards Jam URLs once we know the dealer is up.
+    match jam_stream {
+        Err(e) => {
+            error!("Failed to subscribe to social-connect dealer topic: {e}");
+        }
+        Ok(mut stream) => {
+            tokio::spawn(async move {
+                info!("Jam dealer subscription active — waiting for social-connect messages");
+                while let Some(result) = stream.next().await {
+                    match result {
+                        Err(e) => {
+                            warn!("Jam dealer message error: {e}");
+                        }
+                        Ok(msg) => {
+                            debug!("social-connect message — uri: {}", msg.uri);
+                            let url = extract_jam_url(&msg.payload);
+                            if let Some(url) = url {
+                                info!("Jam session URL received: {url}");
+                                let _ = jam_tx.send(url);
+                            }
                         }
                     }
                 }
-            }
-        });
+                info!("Jam dealer subscription stream ended");
+            });
+        }
     }
 
     let reader = PcmReader::new(pcm_rx, flush_rx);
     Ok((spirc, reader, event_channel, jam_rx))
+}
+
+/// Extracts a Spotify Jam join URL from a dealer message payload.
+///
+/// Spotify delivers `social-connect/v2/session_update` as a JSON-valued payload
+/// whose structure matches the `SessionUpdate` protobuf (field names in camelCase).
+/// We also handle the raw-binary (protobuf) case defensively by attempting a
+/// UTF-8 decode and JSON parse with both camelCase and snake_case key variants.
+fn extract_jam_url(payload: &PayloadValue) -> Option<String> {
+    match payload {
+        PayloadValue::Json(json) => {
+            debug!("social-connect payload (JSON): {json}");
+            parse_jam_url_from_json(json)
+        }
+        PayloadValue::Raw(bytes) => {
+            // The payload arrived as base64-decoded binary.  Spotify sometimes
+            // sends the proto bytes directly; attempt a best-effort UTF-8 parse
+            // in case it is actually JSON wrapped in a different envelope.
+            if let Ok(text) = std::str::from_utf8(bytes) {
+                debug!("social-connect payload (raw/UTF-8): {text}");
+                parse_jam_url_from_json(text)
+            } else {
+                debug!(
+                    "social-connect payload (raw/binary, {} bytes) — cannot parse",
+                    bytes.len()
+                );
+                None
+            }
+        }
+        PayloadValue::Empty => {
+            debug!("social-connect payload is empty");
+            None
+        }
+    }
+}
+
+/// Try to pull `joinSessionUrl` (camelCase) or `join_session_url` (snake_case)
+/// from the top-level object or from a nested `"session"` key.
+fn parse_jam_url_from_json(json: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(json).ok()?;
+
+    // Candidates in priority order
+    let candidates = [
+        // Standard protobuf-JSON (camelCase) — nested under "session"
+        value.pointer("/session/joinSessionUrl"),
+        // snake_case variant
+        value.pointer("/session/join_session_url"),
+        // Sometimes delivered at the top level
+        value.get("joinSessionUrl"),
+        value.get("join_session_url"),
+    ];
+
+    for candidate in candidates.into_iter().flatten() {
+        if let Some(url) = candidate.as_str() {
+            if !url.is_empty() {
+                return Some(url.to_owned());
+            }
+        }
+    }
+
+    None
 }
