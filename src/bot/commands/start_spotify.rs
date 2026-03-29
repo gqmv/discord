@@ -2,9 +2,9 @@ use std::{sync::Arc, time::Duration};
 
 use librespot_playback::player::PlayerEvent;
 use serenity::all::{
-    ActivityData, Color, CommandInteraction, Context, CreateEmbed, CreateEmbedAuthor,
-    CreateEmbedFooter, CreateInteractionResponse, CreateInteractionResponseMessage, CreateMessage,
-    OnlineStatus,
+    ActivityData, Color, CommandInteraction, Context, CreateActionRow, CreateButton, CreateEmbed,
+    CreateEmbedAuthor, CreateEmbedFooter, CreateInteractionResponse,
+    CreateInteractionResponseMessage, CreateMessage, OnlineStatus,
 };
 use songbird::input::{Input, RawAdapter};
 use tokio::sync::oneshot;
@@ -160,23 +160,29 @@ pub async fn run(ctx: &Context, command: &CommandInteraction, cfg: Arc<Config>, 
 
             info!("Jam session started: {url}");
 
-            // Also build an https fallback so the button label can be a
-            // proper hyperlink (Discord embeds don't render spotify:// as links).
+            // Discord buttons require https:// — open.spotify.com redirects
+            // to the native app when Spotify is installed, so this works on
+            // all platforms without needing the spotify:// deep-link.
             let https_url = format!("https://open.spotify.com/socialsession/{token}");
 
             let embed = CreateEmbed::new()
-                .title("🎵 A Jam just started!")
+                .title("A Jam just started!")
                 .description(format!(
                     "**{bot_name_jam}** is hosting a listening session.\n\
-                    Join and listen along in sync."
+                    Join and listen along in sync with everyone."
                 ))
                 .color(Color::from_rgb(30, 215, 96))
-                .field("Open in Spotify app", format!("[tap here]({url})"), true)
-                .field("Open in browser", format!("[tap here]({https_url})"), true)
                 .footer(CreateEmbedFooter::new("Spotify Jam"));
 
+            let button = CreateButton::new_link(&https_url).label("Join the Jam");
+
             let _ = text_ch_id
-                .send_message(&ctx_jam.http, CreateMessage::new().embed(embed))
+                .send_message(
+                    &ctx_jam.http,
+                    CreateMessage::new()
+                        .embed(embed)
+                        .components(vec![CreateActionRow::Buttons(vec![button])]),
+                )
                 .await;
         }
     });
