@@ -134,22 +134,11 @@ pub async fn run(ctx: &Context, command: &CommandInteraction, cfg: Arc<Config>, 
     follow_up(
         ctx,
         command,
-        &format!("✅ **{spotify_name}** — open Spotify, pick **{device_name}** as your device, then hit **Start a Jam** to share the link here!"),
+        &format!("✅ Connected as **{spotify_name}**. Select **{device_name}** in Spotify and hit **Start a Jam** — I'll post the invite here!"),
     )
     .await;
 
-    // Public channel announcement
-    let _ = text_ch_id
-        .send_message(
-            &ctx.http,
-            CreateMessage::new().content(format!(
-                "🎵 **{spotify_name}** started a listening session on **{device_name}**! \
-                Open Spotify → **Start a Jam** → I'll post the link here automatically."
-            )),
-        )
-        .await;
-
-    // ── 8. Jam URL: post the join link publicly when a Jam is started ─────
+    // ── 8. Jam URL: post an embed when a Jam is started ──────────────────
     // We deduplicate by session token so repeated `session_update` events
     // (USER_JOINED, DISCOVERABILITY_CHANGED, …) don't spam the channel.
     let ctx_jam = ctx.clone();
@@ -164,19 +153,30 @@ pub async fn run(ctx: &Context, command: &CommandInteraction, cfg: Arc<Config>, 
                 .unwrap_or(&url)
                 .to_owned();
 
-            if !sent_tokens.insert(token) {
+            if !sent_tokens.insert(token.clone()) {
                 debug!("Jam URL already sent, skipping: {url}");
                 continue;
             }
 
             info!("Jam session started: {url}");
+
+            // Also build an https fallback so the button label can be a
+            // proper hyperlink (Discord embeds don't render spotify:// as links).
+            let https_url = format!("https://open.spotify.com/socialsession/{token}");
+
+            let embed = CreateEmbed::new()
+                .title("🎵 A Jam just started!")
+                .description(format!(
+                    "**{bot_name_jam}** is hosting a listening session.\n\
+                    Join and listen along in sync."
+                ))
+                .color(Color::from_rgb(30, 215, 96))
+                .field("Open in Spotify app", format!("[tap here]({url})"), true)
+                .field("Open in browser", format!("[tap here]({https_url})"), true)
+                .footer(CreateEmbedFooter::new("Spotify Jam"));
+
             let _ = text_ch_id
-                .send_message(
-                    &ctx_jam.http,
-                    CreateMessage::new().content(format!(
-                        "🎵 **{bot_name_jam}** started a Jam — [tap to join]({url})"
-                    )),
-                )
+                .send_message(&ctx_jam.http, CreateMessage::new().embed(embed))
                 .await;
         }
     });
